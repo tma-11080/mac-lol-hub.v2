@@ -1,4 +1,4 @@
-local base = "https://raw.githubusercontent.com/USERNAME/REPO/main/"
+local base = "https://raw.githubusercontent.com/tma-11080/mac-lol-hub.v2/refs/heads/main/"
 
 loadstring(game:HttpGet(base.."config.lua"))()
 
