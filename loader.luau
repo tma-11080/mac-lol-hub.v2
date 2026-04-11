@@ -12,6 +12,7 @@ local RunService = game:GetService("RunService")
 local StatsService = game:GetService("Stats")
 local UIS = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
@@ -29,6 +30,14 @@ local noclip = false
 local currentFontMode = "Default"
 local darkMode = false
 local effectMono = false
+
+-- BF / ported variables
+local superRange = false
+local autoV3 = false
+local autoV4 = false
+local nearestEnemyPos = nil
+local aimbotSkill = false
+local attackRange = 60
 
 local targetPlayerName = ""
 local jumpGui = nil
@@ -170,13 +179,52 @@ local function aimAtTarget(targetChar)
 	Camera.CFrame = CFrame.new(camPos, hrp.Position)
 end
 
+-- =========================================================
+-- BF版 Kill Aura (message.txt より移植)
+-- =========================================================
+local function IsEntityAlive(entity)
+	if not entity then return false end
+	local humanoid = entity:FindFirstChild("Humanoid")
+	return humanoid and humanoid.Health > 0
+end
+
+local function GetEnemiesInRange(character, range)
+	local targets = {}
+	local playerPos = character:GetPivot().Position
+
+	local enemies = workspace:FindFirstChild("Enemies")
+	if enemies then
+		for _, enemy in ipairs(enemies:GetChildren()) do
+			local rootPart = enemy:FindFirstChild("HumanoidRootPart")
+			if rootPart and IsEntityAlive(enemy) then
+				if (rootPart.Position - playerPos).Magnitude <= range then
+					table.insert(targets, enemy)
+				end
+			end
+		end
+	end
+
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		if otherPlayer ~= player and otherPlayer.Character then
+			local rootPart = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if rootPart and IsEntityAlive(otherPlayer.Character) then
+				if (rootPart.Position - playerPos).Magnitude <= range then
+					table.insert(targets, otherPlayer.Character)
+				end
+			end
+		end
+	end
+
+	return targets
+end
+
 local function attackNoCoolDown()
-	local char = getCharacter()
-	local hrp = getHRP(char)
-	if not char or not hrp then return end
+	local character = getCharacter()
+	local hrp = getHRP(character)
+	if not character or not hrp then return end
 
 	local equippedWeapon
-	for _, item in ipairs(char:GetChildren()) do
+	for _, item in ipairs(character:GetChildren()) do
 		if item:IsA("Tool") then
 			equippedWeapon = item
 			break
@@ -184,59 +232,143 @@ local function attackNoCoolDown()
 	end
 	if not equippedWeapon then return end
 
-	local attackRange = hrp:FindFirstChild("Buddha") and 150 or 50
-	local targetChar = getCombatTargetCharacter()
+	if hrp:FindFirstChild("Buddha") and superRange then
+		attackRange = 1000
+	else
+		attackRange = 60
+	end
+
+	local enemiesInRange = GetEnemiesInRange(character, attackRange)
 
 	if equippedWeapon:FindFirstChild("LeftClickRemote") then
-		if targetChar and getHRP(targetChar) then
-			equippedWeapon.LeftClickRemote:FireServer((targetChar.HumanoidRootPart.Position - hrp.Position).Unit, 1)
-		else
-			local enemies = workspace:FindFirstChild("Enemies")
-			if enemies then
-				for _, enemy in ipairs(enemies:GetChildren()) do
-					if enemy:FindFirstChild("HumanoidRootPart") and (enemy.HumanoidRootPart.Position - hrp.Position).Magnitude <= attackRange then
-						equippedWeapon.LeftClickRemote:FireServer((enemy.HumanoidRootPart.Position - hrp.Position).Unit, 1)
-					end
-				end
+		local attackCount = 1
+		for _, enemy in ipairs(enemiesInRange) do
+			local rootPart = enemy:FindFirstChild("HumanoidRootPart")
+			if rootPart then
+				local direction = (rootPart.Position - character:GetPivot().Position).Unit
+				equippedWeapon.LeftClickRemote:FireServer(direction, attackCount)
+				attackCount = attackCount + 1
 			end
 		end
 	else
-		local targets = {}
-		local mainTarget = nil
-
-		if targetChar and targetChar:FindFirstChild("Head") then
-			mainTarget = targetChar.Head
-			table.insert(targets, {targetChar, targetChar.Head})
-		else
-			local enemies = workspace:FindFirstChild("Enemies")
-			if enemies then
-				for _, enemy in ipairs(enemies:GetChildren()) do
-					if enemy:FindFirstChild("Head") and (enemy.Head.Position - hrp.Position).Magnitude <= attackRange then
-						if not mainTarget then
-							mainTarget = enemy.Head
-						end
-						table.insert(targets, {enemy, enemy.Head})
-					end
+		local targets, mainTarget = {}, nil
+		for _, enemy in ipairs(enemiesInRange) do
+			if not enemy:GetAttribute("IsBoat") then
+				local head = enemy:FindFirstChild("Head")
+				if head then
+					table.insert(targets, {enemy, head})
+					mainTarget = head
 				end
 			end
 		end
-
 		if mainTarget then
 			pcall(function()
-				local net = ReplicatedStorage:FindFirstChild("Modules")
-				if net and net:FindFirstChild("Net") and net.Net:FindFirstChild("RE") then
-					if net.Net.RE:FindFirstChild("RegisterAttack") then
-						net.Net.RE.RegisterAttack:FireServer(0.05)
-					end
-					if net.Net.RE:FindFirstChild("RegisterHit") then
-						net.Net.RE.RegisterHit:FireServer(mainTarget, targets)
-					end
-				end
+				local net = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Net")
+				local attackEvent = net:WaitForChild("RE/RegisterAttack")
+				local hitEvent = net:WaitForChild("RE/RegisterHit")
+				attackEvent:FireServer(0.1)
+				hitEvent:FireServer(mainTarget, targets)
 			end)
 		end
 	end
 end
 
+-- =========================================================
+-- nearestEnemyPos 更新ループ (Aimbot 用)
+-- =========================================================
+task.spawn(function()
+	while task.wait(0.1) do
+		local char = getCharacter()
+		if not char or not getHRP(char) then
+			nearestEnemyPos = nil
+			continue
+		end
+		local myPos = getHRP(char).Position
+		local nearestDist = math.huge
+		local nearestEnemy = nil
+		for _, other in ipairs(Players:GetPlayers()) do
+			if other ~= player and other.Character and getHRP(other.Character) then
+				local dist = (getHRP(other.Character).Position - myPos).Magnitude
+				if dist < nearestDist then
+					nearestDist = dist
+					nearestEnemy = other.Character
+				end
+			end
+		end
+		nearestEnemyPos = nearestEnemy and getHRP(nearestEnemy).Position or nil
+	end
+end)
+
+-- =========================================================
+-- Aimbot __namecall フック (message.txt より移植)
+-- =========================================================
+pcall(function()
+	spawn(function()
+		local gg = getrawmetatable(game)
+		local old = gg.__namecall
+		setreadonly(gg, false)
+		gg.__namecall = newcclosure(function(...)
+			local method = getnamecallmethod()
+			local args = {...}
+			if tostring(method) == "FireServer" then
+				if tostring(args[1]) == "RemoteEvent" then
+					if tostring(args[2]) ~= "true" and tostring(args[2]) ~= "false" then
+						if aimbotSkill and nearestEnemyPos then
+							if type(args[2]) == "vector" then
+								args[2] = nearestEnemyPos
+							else
+								args[2] = CFrame.new(nearestEnemyPos)
+							end
+							return old(unpack(args))
+						end
+					end
+				end
+			end
+			return old(...)
+		end)
+	end)
+end)
+
+-- =========================================================
+-- Auto V3 ループ
+-- =========================================================
+task.spawn(function()
+	while task.wait(0.1) do
+		pcall(function()
+			if autoV3 then
+				ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+			end
+		end)
+	end
+end)
+
+-- =========================================================
+-- Auto V4 ループ
+-- =========================================================
+task.spawn(function()
+	local lastCheckTime = 0
+	while task.wait(0.1) do
+		if autoV4 then
+			local currentTime = tick()
+			if currentTime - lastCheckTime >= 0.5 then
+				lastCheckTime = currentTime
+				local character = player.Character
+				if character and character:FindFirstChild("RaceEnergy") and
+					character.RaceEnergy.Value >= 1 and
+					not character.RaceTransformed.Value then
+					local be = game:GetService("VirtualInputManager")
+					be:SendKeyEvent(true, "Y", false, game)
+					task.wait(0.1)
+					be:SendKeyEvent(false, "Y", false, game)
+				end
+			end
+		end
+	end
+end)
+
+-- =========================================================
+-- Auto Aim GUI (既存)
+-- =========================================================
 local function createAutoAimGui()
 	if autoAimGui then
 		autoAimGui:Destroy()
@@ -300,6 +432,9 @@ local function createAutoAimGui()
 	end)
 end
 
+-- =========================================================
+-- Fly GUI
+-- =========================================================
 local function createFlyGui()
 	if flyGui then
 		flyGui:Destroy()
@@ -696,6 +831,10 @@ local function refreshPlayers()
 	return pList
 end
 
+-- =========================================================
+-- タブ構成
+-- =========================================================
+
 local FarmTab = Window:MakeTab({Title = "Main farm Tab", Icon = "Home"})
 FarmTab:AddDropdown({
 	Name = "Scarlet Tool",
@@ -785,6 +924,13 @@ CombatTab:AddToggle({
 	end
 })
 CombatTab:AddToggle({
+	Name = "Aimbot (BF)",
+	Default = false,
+	Callback = function(v)
+		aimbotSkill = v
+	end
+})
+CombatTab:AddToggle({
 	Name = "Silent Aim",
 	Default = false,
 	Callback = function(v)
@@ -796,6 +942,13 @@ CombatTab:AddToggle({
 	Default = false,
 	Callback = function(v)
 		fastAttack = v
+	end
+})
+CombatTab:AddToggle({
+	Name = "Super Range (Buddha Only)",
+	Default = false,
+	Callback = function(v)
+		superRange = v
 	end
 })
 
@@ -956,6 +1109,66 @@ MiscTab:AddToggle({
 	end
 })
 
+-- =========================================================
+-- BF タブ (新規・移植機能)
+-- =========================================================
+local BFTab = Window:MakeTab({Title = "BF", Icon = "zap"})
+
+BFTab:AddToggle({
+	Name = "Remove Lava",
+	Default = false,
+	Callback = function(v)
+		if v then
+			local targets = {"CircleIsland", "GhostShipInterior"}
+			for _, areaName in ipairs(targets) do
+				local map = workspace:FindFirstChild("Map")
+				local area = map and map:FindFirstChild(areaName)
+				if area then
+					for _, obj in ipairs(area:GetDescendants()) do
+						if obj.Name == "LavaParts" then
+							obj:Destroy()
+						end
+					end
+				end
+			end
+		end
+	end
+})
+
+BFTab:AddToggle({
+	Name = "Walk Water",
+	Default = false,
+	Callback = function(v)
+		pcall(function()
+			local waterPlane = workspace.Map["WaterBase-Plane"]
+			if v then
+				waterPlane.Size = Vector3.new(1000, 112, 1000)
+			else
+				waterPlane.Size = Vector3.new(1000, 80, 1000)
+			end
+		end)
+	end
+})
+
+BFTab:AddToggle({
+	Name = "Auto V3",
+	Default = false,
+	Callback = function(v)
+		autoV3 = v
+	end
+})
+
+BFTab:AddToggle({
+	Name = "Auto V4",
+	Default = false,
+	Callback = function(v)
+		autoV4 = v
+	end
+})
+
+-- =========================================================
+-- RenderStepped メインループ
+-- =========================================================
 RunService.RenderStepped:Connect(function()
 	local char = getCharacter()
 	local hrp = getHRP(char)
